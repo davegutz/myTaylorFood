@@ -39,6 +39,14 @@ except ImportError:
     HAS_OCR = False
     ocr_engine = None
 
+# Optional openpyxl for Excel workbook handling
+try:
+    import openpyxl
+    from openpyxl.styles import Font, Alignment, PatternFill
+    HAS_OPENPYXL = True
+except ImportError:
+    HAS_OPENPYXL = False
+  
 plat = sys.platform
 
 # Platform-specific paths
@@ -54,21 +62,21 @@ else:
     default_log_dir = str(Path(local_app_data) / "Temp")
 
 default_archive_dir = os.path.join(default_base_dir, "Archive")
-default_gsheet_path = os.path.join(default_base_dir, "records.gsheet")
-default_csv_path = os.path.join(default_base_dir, "records.csv")
+default_excel_path = os.path.join(default_base_dir, "TaylorMealRecords.xlsx")
+default_csv_path = os.path.join(default_base_dir, "TaylorMealRecords.csv")
 
 # Configuration default values
 default_dict = {
     "paths": {
         "base_folder": default_base_dir,
         "archive_folder": default_archive_dir,
-        "gsheet_path": default_gsheet_path,
+        "excel_path": default_excel_path,
         "last_photo_folder": default_base_dir,
         "last_photo": "",
     },
     "options": {
         "meal_type": "Breakfast",
-        "auto_analyze": "True",
+        "auto_analyze": "False",
         "confirm_record": "True",
         "log_level": "INFO",
     },
@@ -100,6 +108,13 @@ class Begini(ConfigParser):
         print("Config file path:", self.config_file_path)
         if Path(self.config_file_path).is_file():
             self.read(self.config_file_path)
+            # Migrate legacy gsheet_path if present
+            if self.has_option("paths", "gsheet_path") and not self.has_option("paths", "excel_path"):
+                old_p = self.get("paths", "gsheet_path")
+                if "records.gsheet" in old_p:
+                    self.set("paths", "excel_path", default_excel_path)
+                else:
+                    self.set("paths", "excel_path", old_p.replace(".gsheet", ".xlsx"))
             for sec, kv in default_dict_.items():
                 if not self.has_section(sec):
                     self.add_section(sec)
@@ -182,7 +197,12 @@ class FoodAnalyzerApp:
 
         self.current_photo_path = self.cf.get_item("paths", "last_photo", "")
         self.base_folder = self.cf.get_item("paths", "base_folder", default_base_dir)
-        self.gsheet_path = self.cf.get_item("paths", "gsheet_path", default_gsheet_path)
+        self.excel_path = self.cf.get_item("paths", "excel_path", default_excel_path)
+        # Migrate any legacy gsheet reference in config
+        if "records.gsheet" in self.excel_path:
+            self.excel_path = default_excel_path
+            self.cf.put_item("paths", "excel_path", self.excel_path)
+
         self.meal_type_var = tk.StringVar(master, self.cf.get_item("options", "meal_type", "Breakfast"))
         
         self.tk_photo_image = None
@@ -191,6 +211,7 @@ class FoodAnalyzerApp:
 
         self._build_gui()
         self._check_folder_and_file_status()
+        self._init_dependency_watcher()
 
         if self.current_photo_path and Path(self.current_photo_path).is_file():
             self.load_photo(self.current_photo_path, auto_analyze=False)
@@ -208,7 +229,7 @@ class FoodAnalyzerApp:
         title_frame.pack(fill="x", side="top")
         tk.Label(
             title_frame,
-            text="🥗 Taylor Food Photo Analysis & Records",
+            text="🥗 Taylor Food Receipt Analysis & Excel Records",
             font=("Arial bold", 14),
             fg="#ECF0F1",
             bg="#2C3E50"
@@ -218,7 +239,7 @@ class FoodAnalyzerApp:
         top_panel = tk.Frame(self.master, bg=self.bg_color, relief="groove", bd=2, padx=8, pady=6)
         top_panel.pack(fill="x", padx=10, pady=6)
 
-        # Row 1: Target Folder & Sheet Path
+        # Row 1: Target Folder
         row1 = tk.Frame(top_panel, bg=self.bg_color)
         row1.pack(fill="x", pady=2)
         tk.Label(row1, text="Google Drive Folder:", font=self.label_font, bg=self.bg_color, width=18, anchor="w").pack(side="left")
@@ -237,24 +258,24 @@ class FoodAnalyzerApp:
         self.folder_status_lbl = tk.Label(row1, text="📁", font=self.label_font, bg="pink", width=3)
         self.folder_status_lbl.pack(side="left", padx=2)
 
-        # Row 2: Sheet File Path
+        # Row 2: Excel Records File Path
         row2 = tk.Frame(top_panel, bg=self.bg_color)
         row2.pack(fill="x", pady=2)
-        tk.Label(row2, text="Google Sheet File:", font=self.label_font, bg=self.bg_color, width=18, anchor="w").pack(side="left")
-        self.sheet_btn = myButton(
+        tk.Label(row2, text="Excel Records File:", font=self.label_font, bg=self.bg_color, width=18, anchor="w").pack(side="left")
+        self.excel_btn = myButton(
             row2,
-            text=self._shorten_path(self.gsheet_path, 45),
-            command=self.select_gsheet_path,
+            text=self._shorten_path(self.excel_path, 45),
+            command=self.select_excel_path,
             fg="blue",
             bg="white",
             relief="solid",
             bd=1,
             font=self.butt_font
         )
-        self.sheet_btn.pack(side="left", padx=5)
+        self.excel_btn.pack(side="left", padx=5)
 
-        self.sheet_status_lbl = tk.Label(row2, text="📊", font=self.label_font, bg="pink", width=3)
-        self.sheet_status_lbl.pack(side="left", padx=2)
+        self.excel_status_lbl = tk.Label(row2, text="📊", font=self.label_font, bg="pink", width=3)
+        self.excel_status_lbl.pack(side="left", padx=2)
 
         open_folder_btn = myButton(
             row2,
@@ -263,7 +284,17 @@ class FoodAnalyzerApp:
             bg="#D0D3D4",
             font=("Arial", 8)
         )
-        open_folder_btn.pack(side="right", padx=5)
+        open_folder_btn.pack(side="right", padx=3)
+
+        open_excel_btn = myButton(
+            row2,
+            text="📊 Open Excel",
+            command=self.open_excel_file,
+            bg="#D0D3D4",
+            fg="#1E8449",
+            font=("Arial bold", 8)
+        )
+        open_excel_btn.pack(side="right", padx=3)
 
         # Action Buttons Panel (SOC style prominent buttons)
         action_frame = tk.Frame(self.master, bg="#BDC3C7", relief="ridge", bd=2, padx=10, pady=8)
@@ -288,7 +319,7 @@ class FoodAnalyzerApp:
         )
         self.btn_import.pack(side="left", padx=8)
 
-        # Action Button 2: Analyze Photo
+        # Action Button 2: Analyze Photo (OCR)
         self.btn_analyze = myButton(
             action_frame,
             text="🔍 2. Analyze Photo",
@@ -305,11 +336,11 @@ class FoodAnalyzerApp:
         )
         self.btn_analyze.pack(side="left", padx=8)
 
-        # Action Button 3: Record to Google Sheet
+        # Action Button 3: Record to Excel
         self.btn_record = myButton(
             action_frame,
-            text="💾 3. Record to Sheet",
-            command=self.action_record_to_sheet,
+            text="💾 3. Record to Excel",
+            command=self.action_record_to_excel,
             bg="#8E44AD",
             fg="white",
             activebackground="#9B59B6",
@@ -357,8 +388,8 @@ class FoodAnalyzerApp:
         self.image_canvas.pack(fill="both", expand=True, pady=4)
         self.image_canvas.bind("<Configure>", self._on_canvas_resize)
 
-        # Right Column: Analysis Form & Google Sheet Record Fields
-        right_box = tk.LabelFrame(content_frame, text=" Receipt Properties & Sheet Records ", font=self.label_font, bg=self.bg_color, padx=8, pady=6)
+        # Right Column: Analysis Form & Excel Record Fields
+        right_box = tk.LabelFrame(content_frame, text=" Receipt Properties & Excel Records ", font=self.label_font, bg=self.bg_color, padx=8, pady=6)
         right_box.pack(side="right", fill="both", expand=True, padx=(5, 0))
 
         # Form fields grid
@@ -400,7 +431,7 @@ class FoodAnalyzerApp:
         self.entry_ref.grid(row=5, column=1, sticky="we", pady=2)
 
         # Items Table Section
-        items_frame = tk.LabelFrame(right_box, text=" Items & Prices to Record ", font=self.label_font_gentle, bg=self.bg_color, padx=4, pady=4)
+        items_frame = tk.LabelFrame(right_box, text=" Items & Prices to Record in Excel ", font=self.label_font_gentle, bg=self.bg_color, padx=4, pady=4)
         items_frame.pack(fill="both", expand=True, pady=4)
 
         tree_scroll = tk.Scrollbar(items_frame)
@@ -469,11 +500,11 @@ class FoodAnalyzerApp:
         else:
             self.folder_status_lbl.config(bg="pink", text="MISS")
 
-        sheet_exists = Path(self.gsheet_path).exists() or Path(default_csv_path).exists()
-        if sheet_exists:
-            self.sheet_status_lbl.config(bg="lightgreen", text="OK")
+        excel_exists = Path(self.excel_path).exists() and Path(self.excel_path).stat().st_size > 0
+        if excel_exists:
+            self.excel_status_lbl.config(bg="lightgreen", text="OK")
         else:
-            self.sheet_status_lbl.config(bg="pink", text="NEW")
+            self.excel_status_lbl.config(bg="pink", text="NEW")
 
     def _on_meal_type_change(self, *args):
         val = self.meal_type_var.get()
@@ -491,19 +522,19 @@ class FoodAnalyzerApp:
             self._check_folder_and_file_status()
             self.log_status(f"Updated base folder: {new_folder}")
 
-    def select_gsheet_path(self):
+    def select_excel_path(self):
         new_path = filedialog.asksaveasfilename(
-            title="Select or name Google Sheet / record file",
+            title="Select or name Excel Records File",
             initialdir=self.base_folder if Path(self.base_folder).exists() else Path.home(),
-            initialfile="records.gsheet",
-            filetypes=[("Google Sheet / CSV", "*.gsheet;*.csv"), ("All Files", "*.*")]
+            initialfile="TaylorMealRecords.xlsx",
+            filetypes=[("Excel Workbook", "*.xlsx"), ("All Files", "*.*")]
         )
         if new_path:
-            self.gsheet_path = new_path
-            self.cf.put_item("paths", "gsheet_path", new_path)
-            self.sheet_btn.config(text=self._shorten_path(new_path, 45))
+            self.excel_path = new_path
+            self.cf.put_item("paths", "excel_path", new_path)
+            self.excel_btn.config(text=self._shorten_path(new_path, 45))
             self._check_folder_and_file_status()
-            self.log_status(f"Updated records sheet path: {new_path}")
+            self.log_status(f"Updated Excel records file path: {new_path}")
 
     def open_base_folder_in_explorer(self):
         folder = self.base_folder
@@ -521,13 +552,139 @@ class FoodAnalyzerApp:
         else:
             os.system(f'explorer "{folder}"')
 
+    def open_excel_file(self):
+        """Opens the Excel records file in the default spreadsheet application."""
+        file_target = self.excel_path
+        if not Path(file_target).exists() or Path(file_target).stat().st_size == 0:
+            messagebox.showwarning(
+                "File Not Found",
+                f"Excel file does not exist yet:\n{file_target}\n\nPlease click '3. Record to Excel' to create and save records first."
+            )
+            return
+
+        self.log_status(f"Opening Excel file: {os.path.basename(file_target)}")
+        try:
+            if plat == "linux":
+                os.system(f'xdg-open "{file_target}" &')
+            elif plat == "darwin":
+                os.system(f'open "{file_target}" &')
+            else:
+                os.system(f'start "" "{file_target}"')
+        except Exception as e:
+            messagebox.showerror("Open Error", f"Could not open file:\n{file_target}\n{e}")
+
     def log_status(self, msg):
         print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] {msg}")
         self.status_bar.config(text=msg)
 
+    def _init_dependency_watcher(self):
+        """Initializes tracking of script and module modification timestamps."""
+        self._watched_files = {}
+        self._watcher_job = None
+        self._collect_dependency_files()
+        # Start periodic polling (every 1500 ms)
+        self._watcher_job = self.master.after(1500, self._check_dependencies)
+
+    def _collect_dependency_files(self):
+        """Discovers relevant project files and records their initial mtimes."""
+        script_dir = Path(__file__).parent.resolve()
+        
+        # 1. Main script file
+        main_script = Path(__file__).resolve()
+        if main_script.is_file():
+            self._watched_files[str(main_script)] = main_script.stat().st_mtime
+
+        # 2. Config file (.ini)
+        if hasattr(self, "cf") and hasattr(self.cf, "config_file_path"):
+            cfg_p = Path(self.cf.config_file_path).resolve()
+            if cfg_p.is_file():
+                self._watched_files[str(cfg_p)] = cfg_p.stat().st_mtime
+
+        # 3. All python files in project directory
+        for py_file in script_dir.glob("*.py"):
+            p = py_file.resolve()
+            if p.is_file() and str(p) not in self._watched_files:
+                self._watched_files[str(p)] = p.stat().st_mtime
+
+        # 4. Any imported local project modules in sys.modules (ignoring site-packages/.venv)
+        for mod_name, mod in list(sys.modules.items()):
+            if hasattr(mod, "__file__") and mod.__file__:
+                try:
+                    mod_path = Path(mod.__file__).resolve()
+                    if (mod_path.is_file() and script_dir in mod_path.parents 
+                            and ".venv" not in mod_path.parts 
+                            and "site-packages" not in mod_path.parts):
+                        self._watched_files[str(mod_path)] = mod_path.stat().st_mtime
+                except Exception:
+                    pass
+
+    def _check_dependencies(self):
+        """Periodically checks if any watched dependency has been modified."""
+        try:
+            changed_file = None
+            for file_path, initial_mtime in list(self._watched_files.items()):
+                p = Path(file_path)
+                if p.is_file():
+                    current_mtime = p.stat().st_mtime
+                    if current_mtime > initial_mtime:
+                        changed_file = file_path
+                        break
+            
+            if changed_file:
+                self.notify_restart(changed_file)
+                return
+        except Exception as e:
+            print(f"Dependency check error: {e}")
+
+        # Schedule next check
+        self._watcher_job = self.master.after(1500, self._check_dependencies)
+
+    def notify_restart(self, changed_file):
+        """Displays restart prompt when a dependency changes and restarts the GUI upon OK."""
+        file_name = os.path.basename(changed_file)
+        self.log_status(f"Dependency changed: {file_name}. Prompting restart...")
+        
+        answer = messagebox.askokcancel(
+            "Restart Required",
+            f"A dependency of the GUI has changed:\n{file_name}\n\n"
+            f"The application needs to be restarted.\n"
+            f"Click OK to restart now, or Cancel to continue."
+        )
+        
+        if answer:
+            self.restart_app()
+        else:
+            # Update mtime so we don't repeatedly prompt for the same change
+            if changed_file in self._watched_files:
+                try:
+                    self._watched_files[changed_file] = Path(changed_file).stat().st_mtime
+                except Exception:
+                    pass
+            # Resume watcher
+            self._watcher_job = self.master.after(2000, self._check_dependencies)
+
+    def restart_app(self):
+        """Restarts the GUI application cleanly using os.execv."""
+        self.log_status("Restarting GUI application...")
+        try:
+            if self._watcher_job:
+                self.master.after_cancel(self._watcher_job)
+        except Exception:
+            pass
+
+        try:
+            self.master.destroy()
+        except Exception:
+            pass
+
+        # Re-execute the current script with the same interpreter and arguments
+        python_exe = sys.executable
+        args = [python_exe] + sys.argv
+        os.execv(python_exe, args)
+
     def action_import_photo(self):
         """Action Button 1: Automatically picks the oldest photo from the base folder,
-        saves a copy to the Archive folder, and loads it for analysis.
+        saves a copy to the Archive folder, and loads it for analysis (without OCR).
         If no photos are found in the base folder, falls back to a file picker dialog.
         """
         search_dir = self.base_folder
@@ -576,14 +733,6 @@ class FoodAnalyzerApp:
             if not file_path:
                 self.log_status("Photo import cancelled.")
                 return
-
-        # Save a copy to Archive
-        try:
-            dest_archive = Path(archive_dir) / Path(file_path).name
-            shutil.copy2(file_path, dest_archive)
-            self.log_status(f"Archived copy to: {dest_archive.name}")
-        except Exception as e:
-            self.log_status(f"Archive copy warning: {e}")
 
         self.current_photo_path = file_path
         self.cf.put_item("paths", "last_photo", file_path)
@@ -729,7 +878,6 @@ class FoodAnalyzerApp:
         # 1. Date & Meal (from line 3)
         date_val = mtime.strftime("%m/%d/%Y")
         meal_val = "Breakfast"
-        # Check line 3 (index 2) or early lines
         for l in full_text_lines[:5]:
             m = re.search(r"(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\s*([A-Za-z]+)?", l)
             if m:
@@ -747,13 +895,11 @@ class FoodAnalyzerApp:
         # 2. Individual (name on line 4 that begins and ends with '--' or person name on line 4)
         individual_val = ""
         for idx, line_str in enumerate(full_text_lines[:6]):
-            # Check if line contains '-- Name --'
             if "--" in line_str:
                 m = re.search(r"--\s*([^-]+)\s*--", line_str)
                 if m:
                     individual_val = f"--{m.group(1).strip()}--"
                     break
-            # Or line 4 (0-indexed 3)
             if idx == 3:
                 txt = re.sub(r"\bSTE\w*\b", "", line_str, flags=re.IGNORECASE).replace("|", "").strip()
                 txt = txt.strip("- ").strip()
@@ -802,7 +948,6 @@ class FoodAnalyzerApp:
                     ind_balance = balances[-1]
                     break
         if not ind_balance:
-            # Search all text for MealPlan Balance
             for l in full_text_lines:
                 m_bal = re.search(r"Meal\s*Plan\s*Balance\s*[:$]?\s*\$?([\d,]+\.\d{2})", l, re.IGNORECASE)
                 if m_bal:
@@ -827,7 +972,6 @@ class FoodAnalyzerApp:
                 price_part = None
                 text_part = line_text
                 
-                # Check if rightmost element is a dollar price
                 if len(line) >= 2 and re.search(r"^\$?\s*\d+\.\d{2}$", line[-1]["text"]):
                     price_part = re.sub(r"[^\d.]", "", line[-1]["text"])
                     text_part = " ".join(x["text"] for x in line[:-1])
@@ -842,7 +986,6 @@ class FoodAnalyzerApp:
                         "notes": ""
                     })
                 else:
-                    # Modifier / note line attached to preceding item
                     if items_list:
                         items_list[-1]["notes"] = (items_list[-1]["notes"] + " " + line_text).strip()
                         items_list[-1]["item"] = (items_list[-1]["item"] + " (" + line_text.strip() + ")").strip()
@@ -859,7 +1002,7 @@ class FoodAnalyzerApp:
         }
 
     def action_analyze_photo(self):
-        """Action Button 2: Performs receipt text and photo analysis."""
+        """Action Button 2: Performs receipt text and photo analysis (OCR)."""
         if not self.current_photo_path or not Path(self.current_photo_path).is_file():
             messagebox.showwarning("No Photo", "Please import and load a photo first!")
             return
@@ -926,10 +1069,37 @@ class FoodAnalyzerApp:
 
         self.log_status(f"Analysis complete: {len(self.parsed_items)} item(s) detected for {parsed['Individual']}.")
 
-    def action_record_to_sheet(self):
-        """Action Button 3: Records the parsed receipt properties into Google Sheet / CSV in Google Drive.
-        Properties tracked:
-        'Item', 'Price', 'Individual', 'Individual Balance', 'Date', 'Meal', 'Time', 'Ref'
+    def _get_existing_signatures(self, excel_path):
+        """Returns a set of unique signatures from existing rows in Excel."""
+        signatures = set()
+        if Path(excel_path).exists() and Path(excel_path).stat().st_size > 0 and HAS_OPENPYXL:
+            try:
+                wb = openpyxl.load_workbook(excel_path, read_only=True)
+                ws = wb.active
+                for row in ws.iter_rows(values_only=True):
+                    if not row or not any(row):
+                        continue
+                    if len(row) > 7 and str(row[0]).strip().lower() == "item" and str(row[7]).strip().lower() == "ref":
+                        continue
+                    item_name = str(row[0] or "").strip().lower()
+                    date_str = str(row[4] if len(row) > 4 else "").strip()
+                    time_str = str(row[6] if len(row) > 6 else "").strip()
+                    ref_str = str(row[7] if len(row) > 7 else "").strip()
+                    
+                    if ref_str and item_name:
+                        signatures.add((ref_str, item_name))
+                    if ref_str and date_str and time_str and item_name:
+                        signatures.add((ref_str, item_name, date_str, time_str))
+                wb.close()
+            except Exception as e:
+                print("Error reading existing signatures:", e)
+        return signatures
+
+    def action_record_to_excel(self):
+        """Action Button 3: Records the parsed receipt properties into TaylorMealRecords.xlsx in Google Drive.
+        - Prevents duplicate entries from being added twice
+        - Moves the entry's photo to the Archive folder
+        - Updates the recorded path to the photo
         """
         if not self.current_photo_path or not Path(self.current_photo_path).is_file():
             messagebox.showwarning("No Data", "Please import a photo and run analysis before recording.")
@@ -942,7 +1112,6 @@ class FoodAnalyzerApp:
         rec_time = self.entry_time.get().strip()
         ref_num = self.entry_ref.get().strip()
         photo_filename = os.path.basename(self.current_photo_path)
-        photo_full_path = str(Path(self.current_photo_path).resolve())
 
         # Extract items from treeview
         tree_children = self.tree_items.get_children()
@@ -965,7 +1134,55 @@ class FoodAnalyzerApp:
             messagebox.showerror("Folder Error", f"Unable to create folder {self.base_folder}:\n{e}")
             return
 
-        # Header definition for Google Sheet / CSV
+        excel_target = self.excel_path
+        csv_mirror = os.path.join(self.base_folder, "TaylorMealRecords.csv")
+
+        # 1. Duplicate check against existing records
+        existing_signatures = self._get_existing_signatures(excel_target)
+        
+        filtered_items = []
+        duplicate_items = []
+        for it in items_to_save:
+            it_name = it["item"].strip().lower()
+            sig1 = (ref_num, it_name)
+            sig2 = (ref_num, it_name, rec_date, rec_time)
+            if (ref_num and sig1 in existing_signatures) or sig2 in existing_signatures:
+                duplicate_items.append(it["item"])
+            else:
+                filtered_items.append(it)
+
+        # 2. Move photo to Archive folder and update photo path
+        archive_dir = self.cf.get_item("paths", "archive_folder", os.path.join(self.base_folder, "Archive"))
+        try:
+            os.makedirs(archive_dir, exist_ok=True)
+            src_path = Path(self.current_photo_path)
+            if src_path.is_file() and src_path.parent.resolve() != Path(archive_dir).resolve():
+                dest_path = Path(archive_dir) / src_path.name
+                if dest_path.exists() and dest_path != src_path:
+                    dest_path.unlink(missing_ok=True)
+                shutil.move(str(src_path), str(dest_path))
+                self.current_photo_path = str(dest_path.resolve())
+                self.cf.put_item("paths", "last_photo", self.current_photo_path)
+                self.photo_info_lbl.config(
+                    text=f"File: {dest_path.name} (Archived)\nPath: {self.current_photo_path}\nModified: {rec_date} {rec_time}"
+                )
+                self.log_status(f"Moved photo to Archive: {dest_path.name}")
+        except Exception as e:
+            self.log_status(f"Archive move warning: {e}")
+
+        photo_full_path = str(Path(self.current_photo_path).resolve())
+
+        # If all items are duplicate, alert and exit cleanly
+        if not filtered_items:
+            messagebox.showwarning(
+                "Duplicate Record",
+                f"This receipt (Ref: {ref_num}, Date: {rec_date}) has already been recorded in Excel.\n\n"
+                f"Duplicate items skipped:\n- " + "\n- ".join(duplicate_items) + "\n\n"
+                f"The photo has been safely moved to the Archive folder."
+            )
+            self.log_status(f"All {len(duplicate_items)} item(s) skipped as duplicates for Ref {ref_num}.")
+            return
+
         headers = [
             "Item",
             "Price",
@@ -979,18 +1196,69 @@ class FoodAnalyzerApp:
             "Photo Path"
         ]
 
-        csv_target = os.path.join(self.base_folder, "records.csv")
-        file_is_new = not Path(csv_target).exists()
-
+        # Record new entries to Excel file using openpyxl
         try:
-            with open(csv_target, "a", newline="", encoding="utf-8") as f:
+            if HAS_OPENPYXL:
+                if not Path(excel_target).exists() or Path(excel_target).stat().st_size == 0:
+                    wb = openpyxl.Workbook()
+                    ws = wb.active
+                    ws.title = "Meal Records"
+                    ws.append(headers)
+                    # Style headers
+                    header_font = Font(bold=True, color="FFFFFF")
+                    header_fill = PatternFill(start_color="2C3E50", end_color="2C3E50", fill_type="solid")
+                    for col_idx in range(1, len(headers) + 1):
+                        cell = ws.cell(row=1, column=col_idx)
+                        cell.font = header_font
+                        cell.fill = header_fill
+                        cell.alignment = Alignment(horizontal="center")
+                else:
+                    wb = openpyxl.load_workbook(excel_target)
+                    ws = wb.active
+                    if ws.max_row == 0 or (ws.max_row == 1 and ws.cell(row=1, column=1).value is None):
+                        ws.append(headers)
+
+                for it in filtered_items:
+                    try:
+                        price_num = float(it["price"])
+                    except ValueError:
+                        price_num = it["price"]
+                    
+                    try:
+                        bal_num = float(ind_balance.replace("$", "").replace(",", ""))
+                    except ValueError:
+                        bal_num = ind_balance
+
+                    row = [
+                        it["item"],
+                        price_num,
+                        individual,
+                        bal_num,
+                        rec_date,
+                        rec_meal,
+                        rec_time,
+                        ref_num,
+                        photo_filename,
+                        photo_full_path
+                    ]
+                    ws.append(row)
+
+                # Adjust column widths
+                for col in ws.columns:
+                    col_letter = col[0].column_letter
+                    max_len = max(len(str(cell.value or '')) for cell in col)
+                    ws.column_dimensions[col_letter].width = max(max_len + 3, 12)
+
+                wb.save(excel_target)
+            
+            # Also keep companion CSV mirror updated
+            file_is_new = not Path(csv_mirror).exists()
+            with open(csv_mirror, "a", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
                 if file_is_new:
                     writer.writerow(headers)
-                
-                # Write each item as a separate line sharing the receipt properties
-                for it in items_to_save:
-                    row = [
+                for it in filtered_items:
+                    writer.writerow([
                         it["item"],
                         it["price"],
                         individual,
@@ -1001,37 +1269,23 @@ class FoodAnalyzerApp:
                         ref_num,
                         photo_filename,
                         photo_full_path
-                    ]
-                    writer.writerow(row)
-
-            # Update .gsheet companion pointer
-            gsheet_file = self.gsheet_path
-            if not Path(gsheet_file).exists() and gsheet_file.endswith(".gsheet"):
-                try:
-                    meta = {
-                        "name": "records",
-                        "type": "google_sheet",
-                        "local_csv_mirror": csv_target,
-                        "created": datetime.datetime.now().isoformat()
-                    }
-                    with open(gsheet_file, "w", encoding="utf-8") as gf:
-                        json.dump(meta, gf, indent=2)
-                except Exception:
-                    pass
+                    ])
 
             self._check_folder_and_file_status()
-            self.log_status(f"Saved {len(items_to_save)} record(s) for {individual} to {csv_target}")
+            dup_msg = f"\n({len(duplicate_items)} duplicate items skipped)" if duplicate_items else ""
+            self.log_status(f"Saved {len(filtered_items)} record(s) for {individual} to {excel_target}")
             messagebox.showinfo(
                 "Record Saved",
-                f"Successfully appended {len(items_to_save)} item(s) to:\n{csv_target}\n\n"
+                f"Successfully appended {len(filtered_items)} new item(s) to:\n{excel_target}\n\n"
                 f"Individual: {individual}\n"
                 f"Date: {rec_date} {rec_time} ({rec_meal})\n"
                 f"Individual Balance: ${ind_balance}\n"
-                f"Ref: {ref_num}"
+                f"Ref: {ref_num}\n"
+                f"Photo Path: {photo_full_path}{dup_msg}"
             )
         except Exception as e:
-            messagebox.showerror("Save Error", f"Failed to write record to file:\n{e}")
-            self.log_status(f"Save error: {e}")
+            messagebox.showerror("Save Error", f"Failed to write record to Excel:\n{e}")
+            self.log_status(f"Excel save error: {e}")
 
     def action_clear_all(self):
         """Action Button 4: Clears the current photo, analysis, and form fields."""
