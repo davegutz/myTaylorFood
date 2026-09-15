@@ -93,6 +93,7 @@ meal_types = ["Breakfast", "Lunch", "Dinner", "Snack", "Beverage", "Groceries", 
 class Begini(ConfigParser):
     def __init__(self, script_name, default_dict_):
         super().__init__()
+        self.on_save_callback = None
         basename = PurePosixPath(script_name).stem
         if platform.system() == "Linux":
             config_txt = basename + "_linux.ini"
@@ -144,6 +145,8 @@ class Begini(ConfigParser):
         try:
             with open(self.config_file_path, "w") as cfg_file:
                 self.write(cfg_file)
+            if callable(self.on_save_callback):
+                self.on_save_callback(self.config_file_path)
         except Exception as e:
             print(f"Error saving config: {e}")
 
@@ -582,8 +585,21 @@ class FoodAnalyzerApp:
         self._watched_files = {}
         self._watcher_job = None
         self._collect_dependency_files()
+        # Hook up callback so internal .ini updates by GUI_Food don't trigger restart
+        if hasattr(self, "cf"):
+            self.cf.on_save_callback = self._on_internal_config_saved
         # Start periodic polling (every 1500 ms)
         self._watcher_job = self.master.after(1500, self._check_dependencies)
+
+    def _on_internal_config_saved(self, config_path):
+        """Updates internal recorded mtime whenever GUI_Food itself writes to the .ini file,
+        preventing GUI actions from triggering a restart while keeping manual edits detected."""
+        p = Path(config_path).resolve()
+        if p.is_file() and hasattr(self, "_watched_files"):
+            try:
+                self._watched_files[str(p)] = p.stat().st_mtime
+            except Exception:
+                pass
 
     def _collect_dependency_files(self):
         """Discovers relevant project files and records their initial mtimes."""
@@ -824,7 +840,7 @@ class FoodAnalyzerApp:
         if not HAS_OCR or ocr_engine is None:
             # Fallback if OCR library unavailable
             return {
-                "Individual": "--Katherine Gutz--",
+                "Individual": "Katherine Gutz",
                 "Individual Balance": "0.00",
                 "Date": mtime.strftime("%m/%d/%Y"),
                 "Meal": "Breakfast",
@@ -892,22 +908,26 @@ class FoodAnalyzerApp:
                         meal_val = candidate_meal.capitalize()
                 break
 
-        # 2. Individual (name on line 4 that begins and ends with '--' or person name on line 4)
+        # 2. Individual (name identified on line 4, without surrounding '--')
         individual_val = ""
         for idx, line_str in enumerate(full_text_lines[:6]):
             if "--" in line_str:
                 m = re.search(r"--\s*([^-]+)\s*--", line_str)
                 if m:
-                    individual_val = f"--{m.group(1).strip()}--"
+                    individual_val = m.group(1).strip()
                     break
             if idx == 3:
                 txt = re.sub(r"\bSTE\w*\b", "", line_str, flags=re.IGNORECASE).replace("|", "").strip()
                 txt = txt.strip("- ").strip()
                 if txt:
-                    individual_val = f"--{txt}--" if not txt.startswith("--") else txt
+                    individual_val = txt
+
+        # Clean up any residual dashes or whitespace on either end
+        if individual_val:
+            individual_val = individual_val.strip("- ").strip()
 
         if not individual_val:
-            individual_val = "--Katherine Gutz--"
+            individual_val = "Katherine Gutz"
 
         # 3. Time (field 2 and 3 of next to last line -> convert to 24 hr time)
         time_val = mtime.strftime("%H:%M:%S")
@@ -938,20 +958,56 @@ class FoodAnalyzerApp:
             else:
                 ref_val = last_line.replace("|", "").strip()
 
-        # 5. Individual Balance ($ value in Meal Plan Balance)
-        ind_balance = ""
+        # 5. Locate "Current Account Balance" to distinguish Payment vs Individual Balance
+        cab_idx = -1
         for idx, l in enumerate(full_text_lines):
-            if "current account balance" in l.lower() or "mealplan balance" in l.lower() or "meal plan balance" in l.lower():
-                snippet = " ".join(full_text_lines[idx:idx+3])
-                balances = re.findall(r"(?:Balance\s*[:$]?\s*|\$\s*)([\d,]+\.\d{2})", snippet, re.IGNORECASE)
-                if balances:
-                    ind_balance = balances[-1]
+            if re.search(r"Current\s*Account\s*Balance", l, re.IGNORECASE) or re.search(r"Account\s*Balance", l, re.IGNORECASE):
+                cab_idx = idx
+                break
+
+        # 5a. Payment: "Meal Plan Balance : $amount" before Current Account Balance
+        payment_val = ""
+        search_before = full_text_lines[:cab_idx] if cab_idx != -1 else full_text_lines
+        for l in search_before:
+            if re.search(r"Meal\s*Plan\s*Balance", l, re.IGNORECASE) or re.search(r"Payment", l, re.IGNORECASE):
+                m = re.search(r"\$?\s*(\d+[\.,]\d{2})", l)
+                if m:
+                    payment_val = m.group(1).replace(",", ".")
                     break
+                m_int = re.search(r"\$?\s*(\d+)", l)
+                if m_int:
+                    v = m_int.group(1)
+                    payment_val = f"{int(v)/100:.2f}" if len(v) >= 3 else f"{float(v):.2f}"
+                    break
+
+        # 5b. Individual Balance: "Meal Plan Balance : $amount" after Current Account Balance
+        ind_balance = ""
+        search_after = full_text_lines[cab_idx+1:] if cab_idx != -1 else []
+        for l in search_after:
+            if re.search(r"(Meal|Plan|Balance)", l, re.IGNORECASE):
+                # Check for standard decimal dollar amount e.g. $117.50
+                m = re.search(r"\$?\s*(\d+[\.,]\d{2})", l)
+                if m:
+                    ind_balance = m.group(1).replace(",", ".")
+                    break
+                # Check for OCR integer without decimal point e.g. 9150 -> 91.50, 10050 -> 100.50
+                m_digits = re.search(r"(?:Balance|Plan|Meal|[:$])\s*\$?(\d{3,6})", l, re.IGNORECASE)
+                if m_digits:
+                    val_str = m_digits.group(1)
+                    ind_balance = f"{int(val_str)/100:.2f}"
+                    break
+                m_any = re.search(r"\$?(\d{3,6})$", l.strip())
+                if m_any:
+                    val_str = m_any.group(1)
+                    ind_balance = f"{int(val_str)/100:.2f}"
+                    break
+
+        # Fallback if no Current Account Balance section found
         if not ind_balance:
-            for l in full_text_lines:
+            for l in reversed(full_text_lines):
                 m_bal = re.search(r"Meal\s*Plan\s*Balance\s*[:$]?\s*\$?([\d,]+\.\d{2})", l, re.IGNORECASE)
                 if m_bal:
-                    ind_balance = m_bal.group(1)
+                    ind_balance = m_bal.group(1).replace(",", ".")
                     break
 
         # 6. Items & Prices (each of Items that has a price)
@@ -963,7 +1019,7 @@ class FoodAnalyzerApp:
             if re.search(r"\bItems\b", line_text, re.IGNORECASE):
                 in_items = True
                 continue
-            if in_items and re.search(r"\b(Subtotal|Total|Payment|Current Account)\b", line_text, re.IGNORECASE):
+            if in_items and re.search(r"\b(Subtotal|Subtotai|Sub\s*total|Total|Payment|Current Account|Account Balance)\b", line_text, re.IGNORECASE):
                 in_items = False
                 break
             
@@ -992,6 +1048,7 @@ class FoodAnalyzerApp:
 
         return {
             "Individual": individual_val,
+            "Payment": payment_val,
             "Individual Balance": ind_balance,
             "Date": date_val,
             "Meal": meal_val,
@@ -1016,8 +1073,24 @@ class FoodAnalyzerApp:
         self.entry_individual.delete(0, tk.END)
         self.entry_individual.insert(0, parsed["Individual"])
 
+        # Format Individual Balance as $0.00 (from line after Current Account Balance)
+        bal_raw = str(parsed["Individual Balance"]).replace("$", "").replace(",", "").strip()
+        try:
+            bal_num = float(bal_raw)
+            bal_formatted = f"${bal_num:.2f}"
+        except ValueError:
+            bal_formatted = f"${bal_raw}" if bal_raw and not bal_raw.startswith("$") else bal_raw or "$0.00"
+
+        # Format Payment as $0.00 (from line before Current Account Balance)
+        pay_raw = str(parsed.get("Payment", "")).replace("$", "").replace(",", "").strip()
+        try:
+            pay_num = float(pay_raw)
+            pay_formatted = f"${pay_num:.2f}"
+        except ValueError:
+            pay_formatted = f"${pay_raw}" if pay_raw and not pay_raw.startswith("$") else pay_raw or "$0.00"
+
         self.entry_ind_balance.delete(0, tk.END)
-        self.entry_ind_balance.insert(0, parsed["Individual Balance"])
+        self.entry_ind_balance.insert(0, bal_formatted)
 
         self.entry_date.delete(0, tk.END)
         self.entry_date.insert(0, parsed["Date"])
@@ -1033,18 +1106,20 @@ class FoodAnalyzerApp:
         self.entry_ref.delete(0, tk.END)
         self.entry_ref.insert(0, parsed["Ref"])
 
-        # Populate Items Treeview
+        # Populate Items Treeview (formatted as $0.00)
         for item_id in self.tree_items.get_children():
             self.tree_items.delete(item_id)
 
         self.parsed_items = parsed["Items"]
         total_price = 0.0
         for item in self.parsed_items:
-            self.tree_items.insert("", "end", values=(item["item"], f"${float(item['price']):.2f}"))
             try:
-                total_price += float(item["price"])
+                p_val = float(str(item["price"]).replace("$", "").replace(",", "").strip())
+                p_str = f"${p_val:.2f}"
+                total_price += p_val
             except ValueError:
-                pass
+                p_str = str(item["price"])
+            self.tree_items.insert("", "end", values=(item["item"], p_str))
 
         self.lbl_items_summary.config(
             text=f"{len(self.parsed_items)} Item(s) | Total: ${total_price:.2f}"
@@ -1054,7 +1129,8 @@ class FoodAnalyzerApp:
         raw_text_display = [
             "=== RECEIPT ANALYSIS BREAKDOWN ===",
             f"Individual:         {parsed['Individual']}",
-            f"Individual Balance: ${parsed['Individual Balance']}",
+            f"Payment:            {pay_formatted}",
+            f"Individual Balance: {bal_formatted}",
             f"Date (Line 3):      {parsed['Date']}",
             f"Meal (Line 3):      {parsed['Meal']}",
             f"Time (24hr):        {parsed['Time']}",
@@ -1069,27 +1145,212 @@ class FoodAnalyzerApp:
 
         self.log_status(f"Analysis complete: {len(self.parsed_items)} item(s) detected for {parsed['Individual']}.")
 
+    def _normalize_row_data(self, row):
+        """Normalizes an Excel row into standard types and formatted strings with Date, Time, Meal as first columns."""
+        if not row or not any(row):
+            return None
+
+        first_val = row[0]
+        is_first_date = False
+        if isinstance(first_val, (datetime.datetime, datetime.date)):
+            is_first_date = True
+        elif isinstance(first_val, str) and re.search(r'^\d{1,4}[/-]\d{1,2}[/-]\d{2,4}', first_val.strip()):
+            is_first_date = True
+
+        if is_first_date:
+            second_val = row[1] if len(row) > 1 else ""
+            is_second_time = False
+            if isinstance(second_val, (datetime.time, datetime.datetime)):
+                is_second_time = True
+            elif isinstance(second_val, str) and (":" in second_val.strip() or second_val.strip().lower() in ("time", "n/a")):
+                is_second_time = True
+
+            if is_second_time:
+                # Layout: Date(0), Time(1), Meal(2), Item(3), Price(4), Individual(5), IndBalance(6), Ref(7), Photo Filename(8), Photo Path(9)
+                d_val = row[0] if len(row) > 0 else ""
+                t_val = row[1] if len(row) > 1 else ""
+                meal = str(row[2] if len(row) > 2 else "").strip()
+                item = str(row[3] if len(row) > 3 else "").strip()
+                price = row[4] if len(row) > 4 else 0.0
+                individual = str(row[5] if len(row) > 5 else "").strip().strip("- ").strip()
+                bal = row[6] if len(row) > 6 else 0.0
+                ref = str(row[7] if len(row) > 7 else "").strip()
+                photo_name = str(row[8] if len(row) > 8 else "").strip()
+                photo_path = str(row[9] if len(row) > 9 else "").strip()
+            else:
+                # Layout: Date(0), Item(1), Price(2), Individual(3), IndBalance(4), Meal(5), Time(6), Ref(7), Photo Filename(8), Photo Path(9)
+                d_val = row[0] if len(row) > 0 else ""
+                item = str(row[1] if len(row) > 1 else "").strip()
+                price = row[2] if len(row) > 2 else 0.0
+                individual = str(row[3] if len(row) > 3 else "").strip().strip("- ").strip()
+                bal = row[4] if len(row) > 4 else 0.0
+                meal = str(row[5] if len(row) > 5 else "").strip()
+                t_val = row[6] if len(row) > 6 else ""
+                ref = str(row[7] if len(row) > 7 else "").strip()
+                photo_name = str(row[8] if len(row) > 8 else "").strip()
+                photo_path = str(row[9] if len(row) > 9 else "").strip()
+        else:
+            # Old layout: Item(0), Price(1), Individual(2), IndBalance(3), Date(4), Meal(5), Time(6), Ref(7), Photo Filename(8), Photo Path(9)
+            item = str(row[0] if len(row) > 0 else "").strip()
+            price = row[1] if len(row) > 1 else 0.0
+            individual = str(row[2] if len(row) > 2 else "").strip().strip("- ").strip()
+            bal = row[3] if len(row) > 3 else 0.0
+            d_val = row[4] if len(row) > 4 else ""
+            meal = str(row[5] if len(row) > 5 else "").strip()
+            t_val = row[6] if len(row) > 6 else ""
+            ref = str(row[7] if len(row) > 7 else "").strip()
+            photo_name = str(row[8] if len(row) > 8 else "").strip()
+            photo_path = str(row[9] if len(row) > 9 else "").strip()
+
+        # Parse Price
+        try:
+            price_num = float(str(price).replace("$", "").replace(",", "").strip())
+        except (ValueError, TypeError):
+            price_num = 0.0
+        
+        # Parse Balance
+        try:
+            bal_num = float(str(bal).replace("$", "").replace(",", "").strip())
+        except (ValueError, TypeError):
+            bal_num = 0.0
+
+        # Parse Date
+        if isinstance(d_val, (datetime.datetime, datetime.date)):
+            date_str = d_val.strftime("%m/%d/%Y")
+        else:
+            date_str = str(d_val or "").strip()
+            if " " in date_str and len(date_str.split(" ")[0]) >= 8:
+                d_part = date_str.split(" ")[0]
+                for fmt in ["%Y-%m-%d", "%m/%d/%Y", "%m-%d-%Y", "%Y/%m/%d"]:
+                    try:
+                        date_str = datetime.datetime.strptime(d_part, fmt).strftime("%m/%d/%Y")
+                        break
+                    except Exception:
+                        pass
+
+        # Parse Time
+        if isinstance(t_val, (datetime.datetime, datetime.time)):
+            time_str = t_val.strftime("%H:%M:%S")
+        else:
+            time_str = str(t_val or "").strip()
+
+        # Skip row if item name, individual, and ref are all blank
+        if not item and not individual and not ref:
+            return None
+
+        # Skip header rows if encountered
+        if (item.lower() == "item" or date_str.lower() == "date") and (time_str.lower() == "time" or ref.lower() == "ref" or str(meal).lower() == "meal"):
+            return None
+
+        return [date_str, time_str, meal, item, price_num, individual, bal_num, ref, photo_name, photo_path]
+
+    def _parse_row_datetime(self, date_val, time_val):
+        """Parses date and time into a datetime object for accurate chronological sorting."""
+        if isinstance(date_val, datetime.datetime):
+            dt = date_val
+        elif isinstance(date_val, datetime.date):
+            dt = datetime.datetime.combine(date_val, datetime.time.min)
+        else:
+            d_str = str(date_val or "").strip()
+            if " " in d_str:
+                d_str = d_str.split(" ")[0]
+            dt = None
+            for fmt in ["%m/%d/%Y", "%Y-%m-%d", "%m-%d-%Y", "%Y/%m/%d"]:
+                try:
+                    dt = datetime.datetime.strptime(d_str, fmt)
+                    break
+                except Exception:
+                    pass
+            if not dt:
+                return datetime.datetime.min
+
+        if isinstance(time_val, datetime.time):
+            dt = dt.replace(hour=time_val.hour, minute=time_val.minute, second=time_val.second)
+        elif isinstance(time_val, datetime.datetime):
+            dt = dt.replace(hour=time_val.hour, minute=time_val.minute, second=time_val.second)
+        else:
+            t_str = str(time_val or "").strip()
+            for t_fmt in ["%H:%M:%S", "%H:%M", "%I:%M:%S %p", "%I:%M %p"]:
+                try:
+                    t_obj = datetime.datetime.strptime(t_str, t_fmt).time()
+                    dt = dt.replace(hour=t_obj.hour, minute=t_obj.minute, second=t_obj.second)
+                    break
+                except Exception:
+                    pass
+        return dt
+
+    def _clean_sheet_name(self, name):
+        """Sanitizes a string to make it a valid Excel worksheet name (max 31 chars, no invalid chars)."""
+        invalid_chars = r'[\/:*?\[\]]'
+        cleaned = re.sub(invalid_chars, '', str(name or "")).strip()
+        if not cleaned:
+            cleaned = "Unassigned"
+        return cleaned[:31]
+
+    def _write_rows_to_worksheet(self, ws, sheet_title, rows, headers):
+        """Helper to format and populate a worksheet with meal records (Date, Time, Meal first)."""
+        ws.title = sheet_title
+        ws.append(headers)
+
+        # Style header row
+        header_font = Font(bold=True, color="FFFFFF", name="Arial", size=10)
+        header_fill = PatternFill(start_color="2C3E50", end_color="2C3E50", fill_type="solid")
+        for col_idx in range(1, len(headers) + 1):
+            h_cell = ws.cell(row=1, column=col_idx)
+            h_cell.font = header_font
+            h_cell.fill = header_fill
+            h_cell.alignment = Alignment(horizontal="center", vertical="center")
+
+        currency_format = '"$"#,##0.00'
+
+        for row_idx, r_data in enumerate(rows, start=2):
+            for col_idx, val in enumerate(r_data, start=1):
+                cell = ws.cell(row=row_idx, column=col_idx)
+                
+                # Price (Col 5) & Individual Balance (Col 7)
+                if col_idx in (5, 7):
+                    try:
+                        num_val = float(str(val).replace("$", "").replace(",", "").strip())
+                    except (ValueError, TypeError):
+                        num_val = val
+                    cell.value = num_val
+                    cell.number_format = currency_format
+                    cell.alignment = Alignment(horizontal="right", vertical="center")
+                elif col_idx in (1, 2, 3, 6, 8):
+                    # Date (1), Time (2), Meal (3), Individual (6), Ref (8)
+                    cell.value = str(val or "")
+                    cell.alignment = Alignment(horizontal="center", vertical="center")
+                else:
+                    # Item (4), Photo Filename (9), Photo Path (10)
+                    cell.value = str(val or "")
+                    cell.alignment = Alignment(horizontal="left", vertical="center")
+
+        # Adjust column widths
+        for col in ws.columns:
+            col_letter = col[0].column_letter
+            max_len = max(len(str(cell.value or '')) for cell in col)
+            ws.column_dimensions[col_letter].width = max(max_len + 4, 12)
+
     def _get_existing_signatures(self, excel_path):
         """Returns a set of unique signatures from existing rows in Excel."""
         signatures = set()
         if Path(excel_path).exists() and Path(excel_path).stat().st_size > 0 and HAS_OPENPYXL:
             try:
                 wb = openpyxl.load_workbook(excel_path, read_only=True)
-                ws = wb.active
-                for row in ws.iter_rows(values_only=True):
-                    if not row or not any(row):
-                        continue
-                    if len(row) > 7 and str(row[0]).strip().lower() == "item" and str(row[7]).strip().lower() == "ref":
-                        continue
-                    item_name = str(row[0] or "").strip().lower()
-                    date_str = str(row[4] if len(row) > 4 else "").strip()
-                    time_str = str(row[6] if len(row) > 6 else "").strip()
-                    ref_str = str(row[7] if len(row) > 7 else "").strip()
-                    
-                    if ref_str and item_name:
-                        signatures.add((ref_str, item_name))
-                    if ref_str and date_str and time_str and item_name:
-                        signatures.add((ref_str, item_name, date_str, time_str))
+                for ws in wb.worksheets:
+                    for raw_row in ws.iter_rows(values_only=True):
+                        norm = self._normalize_row_data(raw_row)
+                        if not norm:
+                            continue
+                        date_str = norm[0]
+                        time_str = norm[1]
+                        item_name = norm[3].lower()
+                        ref_str = norm[7]
+                        
+                        if ref_str and ref_str not in ("n/a", "none") and item_name:
+                            signatures.add((ref_str, item_name))
+                        if ref_str and date_str and time_str and item_name:
+                            signatures.add((ref_str, item_name, date_str, time_str))
                 wb.close()
             except Exception as e:
                 print("Error reading existing signatures:", e)
@@ -1097,15 +1358,20 @@ class FoodAnalyzerApp:
 
     def action_record_to_excel(self):
         """Action Button 3: Records the parsed receipt properties into TaylorMealRecords.xlsx in Google Drive.
-        - Prevents duplicate entries from being added twice
-        - Moves the entry's photo to the Archive folder
-        - Updates the recorded path to the photo
+        - Moves the entry's photo to the Archive folder (and removes it from the main folder)
+        - If there is a repeat entry (matching Ref, Photo Filename, or Individual+Date+Time), overwrites with the latest data
+        - Updates the recorded path to the photo in the Archive
+        - Date (col 1), Time (col 2), Meal (col 3) as first columns
+        - Splits records into subsheets for each Individual (plus master 'All Records' sheet)
+        - Sorts all records by date & time (most recent first)
+        - Formats Price and Individual Balance as $0.00 currency
+        - Performs deduplication to eliminate repeated transactions
         """
         if not self.current_photo_path or not Path(self.current_photo_path).is_file():
             messagebox.showwarning("No Data", "Please import a photo and run analysis before recording.")
             return
 
-        individual = self.entry_individual.get().strip()
+        individual = self.entry_individual.get().strip().strip("- ").strip()
         ind_balance = self.entry_ind_balance.get().strip()
         rec_date = self.entry_date.get().strip()
         rec_meal = self.meal_type_var.get().strip()
@@ -1137,29 +1403,15 @@ class FoodAnalyzerApp:
         excel_target = self.excel_path
         csv_mirror = os.path.join(self.base_folder, "TaylorMealRecords.csv")
 
-        # 1. Duplicate check against existing records
-        existing_signatures = self._get_existing_signatures(excel_target)
-        
-        filtered_items = []
-        duplicate_items = []
-        for it in items_to_save:
-            it_name = it["item"].strip().lower()
-            sig1 = (ref_num, it_name)
-            sig2 = (ref_num, it_name, rec_date, rec_time)
-            if (ref_num and sig1 in existing_signatures) or sig2 in existing_signatures:
-                duplicate_items.append(it["item"])
-            else:
-                filtered_items.append(it)
-
-        # 2. Move photo to Archive folder and update photo path
-        archive_dir = self.cf.get_item("paths", "archive_folder", os.path.join(self.base_folder, "Archive"))
+        # 1. Move photo to Archive folder and update path
+        archive_dir = Path(self.cf.get_item("paths", "archive_folder", os.path.join(self.base_folder, "Archive"))).resolve()
         try:
-            os.makedirs(archive_dir, exist_ok=True)
-            src_path = Path(self.current_photo_path)
-            if src_path.is_file() and src_path.parent.resolve() != Path(archive_dir).resolve():
-                dest_path = Path(archive_dir) / src_path.name
+            archive_dir.mkdir(parents=True, exist_ok=True)
+            src_path = Path(self.current_photo_path).resolve()
+            if src_path.is_file() and src_path.parent != archive_dir:
+                dest_path = archive_dir / src_path.name
                 if dest_path.exists() and dest_path != src_path:
-                    dest_path.unlink(missing_ok=True)
+                    dest_path.unlink()
                 shutil.move(str(src_path), str(dest_path))
                 self.current_photo_path = str(dest_path.resolve())
                 self.cf.put_item("paths", "last_photo", self.current_photo_path)
@@ -1172,116 +1424,201 @@ class FoodAnalyzerApp:
 
         photo_full_path = str(Path(self.current_photo_path).resolve())
 
-        # If all items are duplicate, alert and exit cleanly
-        if not filtered_items:
-            messagebox.showwarning(
-                "Duplicate Record",
-                f"This receipt (Ref: {ref_num}, Date: {rec_date}) has already been recorded in Excel.\n\n"
-                f"Duplicate items skipped:\n- " + "\n- ".join(duplicate_items) + "\n\n"
-                f"The photo has been safely moved to the Archive folder."
-            )
-            self.log_status(f"All {len(duplicate_items)} item(s) skipped as duplicates for Ref {ref_num}.")
-            return
-
+        # Date, Time, Meal are the first three columns
         headers = [
+            "Date",
+            "Time",
+            "Meal",
             "Item",
             "Price",
             "Individual",
             "Individual Balance",
-            "Date",
-            "Meal",
-            "Time",
             "Ref",
             "Photo Filename",
             "Photo Path"
         ]
 
-        # Record new entries to Excel file using openpyxl
+        # 2. Load existing rows from Excel and normalize them
+        all_rows = []
+        if HAS_OPENPYXL and Path(excel_target).exists() and Path(excel_target).stat().st_size > 0:
+            try:
+                wb_existing = openpyxl.load_workbook(excel_target, data_only=True)
+                sheets_to_read = []
+                if "All Records" in wb_existing.sheetnames:
+                    sheets_to_read = [wb_existing["All Records"]]
+                elif "Meal Records" in wb_existing.sheetnames:
+                    sheets_to_read = [wb_existing["Meal Records"]]
+                else:
+                    sheets_to_read = wb_existing.worksheets
+
+                for ws_existing in sheets_to_read:
+                    for row in ws_existing.iter_rows(min_row=2, values_only=True):
+                        norm = self._normalize_row_data(row)
+                        if norm:
+                            all_rows.append(norm)
+                wb_existing.close()
+            except Exception as e:
+                print(f"Notice: could not load existing Excel rows: {e}")
+
+        # 3. Overwrite repeat entries (matching Ref, Photo Filename, or Individual + Date + Time)
+        kept_rows = []
+        overwritten_count = 0
+        for r in all_rows:
+            r_date = str(r[0] or "").strip()
+            r_time = str(r[1] or "").strip()
+            r_item = str(r[3] or "").strip()
+            r_ind = str(r[5] or "").strip()
+            r_ref = str(r[7] or "").strip()
+            r_file = str(r[8] or "").strip()
+
+            is_repeat = False
+            # Match 1: Ref number (if present and not dummy/na)
+            if ref_num and ref_num not in ("n/a", "none", "9999999") and r_ref == ref_num:
+                is_repeat = True
+            # Match 2: Exact photo filename
+            elif photo_filename and photo_filename not in ("n/a", "none") and r_file == photo_filename:
+                is_repeat = True
+            # Match 3: Same individual, date, and time
+            elif (individual and r_ind.lower() == individual.lower() and
+                  rec_date and r_date == rec_date and
+                  rec_time and r_time == rec_time and
+                  rec_date not in ("n/a", "none") and rec_time not in ("n/a", "none")):
+                is_repeat = True
+
+            if is_repeat:
+                overwritten_count += 1
+            else:
+                kept_rows.append(r)
+
+        # Build latest rows for this receipt (Date, Time, Meal first)
+        new_entries = []
+        for it in items_to_save:
+            try:
+                price_num = float(str(it["price"]).replace("$", "").replace(",", "").strip())
+            except ValueError:
+                price_num = 0.0
+            
+            try:
+                bal_clean = str(ind_balance).replace("$", "").replace(",", "").strip()
+                bal_num = float(bal_clean)
+            except ValueError:
+                bal_num = 0.0
+
+            new_row = [
+                rec_date,
+                rec_time,
+                rec_meal,
+                it["item"],
+                price_num,
+                individual,
+                bal_num,
+                ref_num,
+                photo_filename,
+                photo_full_path
+            ]
+            new_entries.append(new_row)
+
+        combined_rows = kept_rows + new_entries
+
+        # 4. Table-wide Deduplication Pass: Ensure no identical or repeat records remain
+        deduped_rows = []
+        seen_keys = set()
+        for r in combined_rows:
+            r_date = str(r[0] or "").strip()
+            r_time = str(r[1] or "").strip()
+            r_item = str(r[3] or "").strip().lower()
+            try:
+                r_price_val = f"{float(r[4]):.2f}"
+            except Exception:
+                r_price_val = str(r[4])
+            r_ind = str(r[5] or "").strip().lower()
+            r_ref = str(r[7] or "").strip()
+
+            # Unique key combination for each item entry
+            key = (r_ind, r_date, r_time, r_item, r_price_val)
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            deduped_rows.append(r)
+
+        # 5. Sort all rows by Date & Time: most recent first (descending)
+        deduped_rows.sort(key=lambda r: self._parse_row_datetime(r[0], r[1]), reverse=True)
+
+        # 6. Write to Excel file using openpyxl with subsheets for each Individual
         try:
             if HAS_OPENPYXL:
-                if not Path(excel_target).exists() or Path(excel_target).stat().st_size == 0:
-                    wb = openpyxl.Workbook()
-                    ws = wb.active
-                    ws.title = "Meal Records"
-                    ws.append(headers)
-                    # Style headers
-                    header_font = Font(bold=True, color="FFFFFF")
-                    header_fill = PatternFill(start_color="2C3E50", end_color="2C3E50", fill_type="solid")
-                    for col_idx in range(1, len(headers) + 1):
-                        cell = ws.cell(row=1, column=col_idx)
-                        cell.font = header_font
-                        cell.fill = header_fill
-                        cell.alignment = Alignment(horizontal="center")
-                else:
-                    wb = openpyxl.load_workbook(excel_target)
-                    ws = wb.active
-                    if ws.max_row == 0 or (ws.max_row == 1 and ws.cell(row=1, column=1).value is None):
-                        ws.append(headers)
+                wb = openpyxl.Workbook()
+                
+                # 6a. Main / Master sheet: "All Records"
+                ws_all = wb.active
+                self._write_rows_to_worksheet(ws_all, "All Records", deduped_rows, headers)
 
-                for it in filtered_items:
-                    try:
-                        price_num = float(it["price"])
-                    except ValueError:
-                        price_num = it["price"]
-                    
-                    try:
-                        bal_num = float(ind_balance.replace("$", "").replace(",", ""))
-                    except ValueError:
-                        bal_num = ind_balance
+                # 6b. Individual subsheets: Distinct worksheet for each individual
+                individuals_found = []
+                for r in deduped_rows:
+                    ind_n = str(r[5] or "").strip()
+                    if ind_n and ind_n not in individuals_found:
+                        individuals_found.append(ind_n)
 
-                    row = [
-                        it["item"],
-                        price_num,
-                        individual,
-                        bal_num,
-                        rec_date,
-                        rec_meal,
-                        rec_time,
-                        ref_num,
-                        photo_filename,
-                        photo_full_path
-                    ]
-                    ws.append(row)
+                # Sort individual tab names alphabetically
+                individuals_found.sort(key=lambda s: s.lower())
 
-                # Adjust column widths
-                for col in ws.columns:
-                    col_letter = col[0].column_letter
-                    max_len = max(len(str(cell.value or '')) for cell in col)
-                    ws.column_dimensions[col_letter].width = max(max_len + 3, 12)
+                for ind_name in individuals_found:
+                    ind_rows = [r for r in deduped_rows if str(r[5] or "").strip().lower() == ind_name.lower()]
+                    sheet_title = self._clean_sheet_name(ind_name)
+                    if sheet_title in wb.sheetnames:
+                        ws_ind = wb[sheet_title]
+                    else:
+                        ws_ind = wb.create_sheet(title=sheet_title)
+                    self._write_rows_to_worksheet(ws_ind, sheet_title, ind_rows, headers)
 
                 wb.save(excel_target)
             
-            # Also keep companion CSV mirror updated
-            file_is_new = not Path(csv_mirror).exists()
-            with open(csv_mirror, "a", newline="", encoding="utf-8") as f:
+            # 7. Also write sorted CSV mirror
+            with open(csv_mirror, "w", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
-                if file_is_new:
-                    writer.writerow(headers)
-                for it in filtered_items:
-                    writer.writerow([
-                        it["item"],
-                        it["price"],
-                        individual,
-                        ind_balance,
-                        rec_date,
-                        rec_meal,
-                        rec_time,
-                        ref_num,
-                        photo_filename,
-                        photo_full_path
-                    ])
+                writer.writerow(headers)
+                for r_data in deduped_rows:
+                    try:
+                        p_f = float(str(r_data[4]).replace("$", "").replace(",", "").strip())
+                        p_str = f"${p_f:.2f}"
+                    except (ValueError, TypeError):
+                        p_str = str(r_data[4])
+
+                    try:
+                        b_f = float(str(r_data[6]).replace("$", "").replace(",", "").strip())
+                        b_str = f"${b_f:.2f}"
+                    except (ValueError, TypeError):
+                        b_str = str(r_data[6])
+
+                    csv_row = [
+                        r_data[0],  # Date
+                        r_data[1],  # Time
+                        r_data[2],  # Meal
+                        r_data[3],  # Item
+                        p_str,      # Price
+                        r_data[5],  # Individual
+                        b_str,      # Individual Balance
+                        r_data[7],  # Ref
+                        r_data[8],  # Photo Filename
+                        r_data[9]   # Photo Path
+                    ]
+                    writer.writerow(csv_row)
 
             self._check_folder_and_file_status()
-            dup_msg = f"\n({len(duplicate_items)} duplicate items skipped)" if duplicate_items else ""
-            self.log_status(f"Saved {len(filtered_items)} record(s) for {individual} to {excel_target}")
+            update_status_str = f"Updated (overwrote {overwritten_count} prior row(s))" if overwritten_count > 0 else f"Saved {len(new_entries)} new row(s)"
+            self.log_status(f"{update_status_str} for {individual} in {excel_target} (Date, Time, Meal first)")
+            
+            msg_action = f"Overwrote {overwritten_count} previous record(s) with latest data" if overwritten_count > 0 else f"Recorded {len(new_entries)} item(s)"
             messagebox.showinfo(
                 "Record Saved",
-                f"Successfully appended {len(filtered_items)} new item(s) to:\n{excel_target}\n\n"
+                f"{msg_action} in:\n{excel_target}\n\n"
                 f"Individual: {individual}\n"
                 f"Date: {rec_date} {rec_time} ({rec_meal})\n"
-                f"Individual Balance: ${ind_balance}\n"
+                f"Individual Balance: ${bal_num:.2f}\n"
                 f"Ref: {ref_num}\n"
-                f"Photo Path: {photo_full_path}{dup_msg}"
+                f"Photo Moved To: {photo_full_path}\n\n"
+                f"Workbook updated (Date, Time, Meal first)."
             )
         except Exception as e:
             messagebox.showerror("Save Error", f"Failed to write record to Excel:\n{e}")
