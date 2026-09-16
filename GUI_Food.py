@@ -25,10 +25,12 @@ from tkinter import filedialog, messagebox, ttk
 
 # Optional PIL support for robust image handling
 try:
-    from PIL import Image, ImageTk
+    from PIL import Image, ImageTk, ImageOps
+    import numpy as np
     HAS_PIL = True
 except ImportError:
     HAS_PIL = False
+    np = None
 
 # Optional RapidOCR support for reading receipt text
 try:
@@ -777,10 +779,73 @@ class FoodAnalyzerApp:
                 bd=2
             )
 
+    def _ensure_image_upright(self, photo_path):
+        """Detects if an imported receipt photo is sideways or upside down, rotates it upright, and resaves it."""
+        if not HAS_PIL or not Path(photo_path).is_file():
+            return photo_path
+
+        try:
+            with Image.open(photo_path) as im:
+                transposed = ImageOps.exif_transpose(im)
+                w, h = transposed.size
+                
+                # Check candidate angles (portrait receipts should be taller than wide)
+                candidates = [0, 90, 180, 270] if w > h else [0, 180]
+                
+                best_angle = 0
+                best_score = -999999
+                best_img = transposed
+                
+                for angle in candidates:
+                    cand_img = transposed if angle == 0 else transposed.rotate(angle, expand=True)
+                    cw, ch = cand_img.size
+                    aspect_score = 100.0 if ch > cw else -100.0
+                    
+                    top_score = 0
+                    bottom_score = 0
+                    
+                    if HAS_OCR and ocr_engine is not None and np is not None:
+                        # Fast downscaled OCR check to verify text direction
+                        scale = min(1000 / max(cw, ch), 1.0)
+                        small = cand_img.resize((max(int(cw * scale), 1), max(int(ch * scale), 1)), Image.Resampling.LANCZOS)
+                        res, _ = ocr_engine(np.array(small))
+                        if res:
+                            sh = small.size[1]
+                            header_keywords = ['taylor', 'community', 'meredith', 'mb-il', 'mb-1', 'items']
+                            footer_keywords = ['printed by', 'edt', 'est', 'meal plan balance', 'current account balance', 'subtotal', 'total']
+                            for box, text, conf in res:
+                                y_center = sum(pt[1] for pt in box) / 4.0
+                                txt = text.strip().lower()
+                                if any(k in txt for k in header_keywords):
+                                    top_score += 15 if y_center < sh * 0.45 else -15
+                                if any(k in txt for k in footer_keywords) or re.search(r'\d{1,2}:\d{2}(?::\d{2})?\s*(?:am|pm)', txt):
+                                    bottom_score += 10 if y_center > sh * 0.50 else -10
+                                if re.search(r'\b16\d{7}\b', txt):
+                                    bottom_score += 25 if y_center > sh * 0.70 else -25
+
+                    total_score = aspect_score + top_score + bottom_score
+                    if total_score > best_score:
+                        best_score = total_score
+                        best_angle = angle
+                        best_img = cand_img
+
+                # Check if rotation was needed or EXIF transposition changed dimensions/orientation
+                needed_rotation = (best_angle != 0) or (transposed.size != im.size)
+                if needed_rotation:
+                    best_img.save(photo_path, quality=95)
+                    self.log_status(f"Detected rotated image (angle={best_angle}°); rotated upright and resaved {Path(photo_path).name}.")
+        except Exception as e:
+            self.log_status(f"Notice: orientation check skipped: {e}")
+
+        return photo_path
+
     def load_photo(self, photo_path, auto_analyze=False):
         if not Path(photo_path).is_file():
             self.log_status(f"File not found: {photo_path}")
             return
+
+        # 1. Detect if image is sideways or rotated, rotate upright, and resave
+        photo_path = self._ensure_image_upright(photo_path)
 
         p = Path(photo_path)
         mtime = datetime.datetime.fromtimestamp(p.stat().st_mtime)
