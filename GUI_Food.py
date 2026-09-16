@@ -756,6 +756,27 @@ class FoodAnalyzerApp:
 
         self.load_photo(file_path, auto_analyze=False)
 
+    def _highlight_clear_button(self, highlight=True):
+        """Highlights the Clear button with a bright, bold color when a photo is imported, or resets it to normal."""
+        if highlight:
+            self.btn_clear.config(
+                bg="#E74C3C",
+                activebackground="#C0392B",
+                fg="white",
+                font=self.butt_font_large,
+                relief="raised",
+                bd=3
+            )
+        else:
+            self.btn_clear.config(
+                bg="#7F8C8D",
+                activebackground="#95A5A6",
+                fg="white",
+                font=self.butt_font,
+                relief="raised",
+                bd=2
+            )
+
     def load_photo(self, photo_path, auto_analyze=False):
         if not Path(photo_path).is_file():
             self.log_status(f"File not found: {photo_path}")
@@ -777,7 +798,8 @@ class FoodAnalyzerApp:
 
         # Render photo on canvas
         self._render_photo_on_canvas(photo_path)
-        self.log_status(f"Loaded photo: {p.name}. Click '2. Analyze Photo' to run OCR.")
+        self._highlight_clear_button(True)
+        self.log_status(f"Loaded photo: {p.name}. Click '2. Analyze Photo' or '🔄 Clear' to archive.")
 
         if auto_analyze:
             self.action_analyze_photo()
@@ -908,22 +930,44 @@ class FoodAnalyzerApp:
                         meal_val = candidate_meal.capitalize()
                 break
 
-        # 2. Individual (name identified on line 4, without surrounding '--')
+        # 2. Individual (name identified on line 4 or between '-- ... --', excluding room info denoted by '- <unit>')
         individual_val = ""
-        for idx, line_str in enumerate(full_text_lines[:6]):
-            if "--" in line_str:
-                m = re.search(r"--\s*([^-]+)\s*--", line_str)
-                if m:
-                    individual_val = m.group(1).strip()
-                    break
-            if idx == 3:
-                txt = re.sub(r"\bSTE\w*\b", "", line_str, flags=re.IGNORECASE).replace("|", "").strip()
-                txt = txt.strip("- ").strip()
-                if txt:
-                    individual_val = txt
+        # Check first for known individuals in the header lines
+        for l in full_text_lines[:8]:
+            l_clean = l.replace("|", " ")
+            if re.search(r"\bKatherine\s+Gutz\b", l_clean, re.IGNORECASE):
+                individual_val = "Katherine Gutz"
+                break
+            elif re.search(r"\bDavid\s+Gutz\b", l_clean, re.IGNORECASE):
+                individual_val = "David Gutz"
+                break
 
-        # Clean up any residual dashes or whitespace on either end
+        if not individual_val:
+            for idx, line_str in enumerate(full_text_lines[:6]):
+                if "--" in line_str:
+                    m = re.search(r"--\s*(.+?)\s*--", line_str)
+                    if m:
+                        candidate = m.group(1).strip()
+                        # Strip room information denoted by '-' followed by a space and unit number / STE / room designation
+                        candidate = re.sub(r"\s*-\s+(?:STE\w*|APT\w*|Unit\w*|Room\w*|MB\w*|[A-Za-z]*\d+\w*|\d+\w*|[A-Za-z]\b).*$", "", candidate, flags=re.IGNORECASE)
+                        candidate = re.sub(r"\bSTE\w*\b", "", candidate, flags=re.IGNORECASE)
+                        candidate = candidate.strip("- ").strip()
+                        if candidate:
+                            individual_val = candidate
+                            break
+                if idx == 3 and not individual_val:
+                    txt = line_str.replace("|", " ")
+                    # Strip room information denoted by '-' followed by a space and unit number / STE / room designation
+                    txt = re.sub(r"\s*-\s+(?:STE\w*|APT\w*|Unit\w*|Room\w*|MB\w*|[A-Za-z]*\d+\w*|\d+\w*|[A-Za-z]\b).*$", "", txt, flags=re.IGNORECASE)
+                    txt = re.sub(r"\bSTE\w*\b", "", txt, flags=re.IGNORECASE)
+                    txt = txt.strip("- ").strip()
+                    if txt:
+                        individual_val = txt
+
+        # Clean up any residual room notations, dashes, or whitespace on either end
         if individual_val:
+            individual_val = re.sub(r"\s*-\s+(?:STE\w*|APT\w*|Unit\w*|Room\w*|MB\w*|[A-Za-z]*\d+\w*|\d+\w*|[A-Za-z]\b).*$", "", individual_val, flags=re.IGNORECASE)
+            individual_val = re.sub(r"\bSTE\w*\b", "", individual_val, flags=re.IGNORECASE)
             individual_val = individual_val.strip("- ").strip()
 
         if not individual_val:
@@ -1605,6 +1649,7 @@ class FoodAnalyzerApp:
                     ]
                     writer.writerow(csv_row)
 
+            self._highlight_clear_button(False)
             self._check_folder_and_file_status()
             update_status_str = f"Updated (overwrote {overwritten_count} prior row(s))" if overwritten_count > 0 else f"Saved {len(new_entries)} new row(s)"
             self.log_status(f"{update_status_str} for {individual} in {excel_target} (Date, Time, Meal first)")
@@ -1625,10 +1670,30 @@ class FoodAnalyzerApp:
             self.log_status(f"Excel save error: {e}")
 
     def action_clear_all(self):
-        """Action Button 4: Clears the current photo, analysis, and form fields."""
+        """Action Button 4: Clears the current photo, moves it to Archive, and blanks the screen ready for next import."""
+        # 1. If an image is currently loaded, move it to Archive
+        if self.current_photo_path and Path(self.current_photo_path).is_file():
+            src_path = Path(self.current_photo_path).resolve()
+            archive_dir = Path(self.cf.get_item("paths", "archive_folder", os.path.join(self.base_folder, "Archive"))).resolve()
+            try:
+                archive_dir.mkdir(parents=True, exist_ok=True)
+                if src_path.parent != archive_dir:
+                    dest_path = archive_dir / src_path.name
+                    if dest_path.exists() and dest_path != src_path:
+                        dest_path.unlink()
+                    shutil.move(str(src_path), str(dest_path))
+                    self.log_status(f"Moved photo to Archive: {dest_path.name}")
+            except Exception as e:
+                self.log_status(f"Archive move warning: {e}")
+
+        # 2. Blank the canvas / photo preview
         self.current_photo_path = ""
+        self._current_pil_image = None
+        self.tk_photo_image = None
         self.image_canvas.delete("all")
         self.photo_info_lbl.config(text="No photo loaded. Click '1. Import' above.")
+
+        # 3. Clear all form fields
         self.entry_individual.delete(0, tk.END)
         self.entry_ind_balance.delete(0, tk.END)
         self.entry_date.delete(0, tk.END)
@@ -1636,12 +1701,19 @@ class FoodAnalyzerApp:
         self.entry_time.delete(0, tk.END)
         self.entry_time.insert(0, datetime.datetime.now().strftime("%H:%M:%S"))
         self.entry_ref.delete(0, tk.END)
+        self.meal_type_var.set("Breakfast")
+
+        # 4. Clear items and analysis logs
         for item_id in self.tree_items.get_children():
             self.tree_items.delete(item_id)
         self.parsed_items = []
         self.lbl_items_summary.config(text="0 Items | Total: $0.00")
         self.txt_analysis.delete("1.0", tk.END)
-        self.log_status("Form cleared.")
+
+        # 5. Reset Clear button highlight and update folder status
+        self._highlight_clear_button(False)
+        self._check_folder_and_file_status()
+        self.log_status("Screen cleared and photo archived; ready for next import.")
 
 
 def main():
