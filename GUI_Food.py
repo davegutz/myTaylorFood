@@ -436,9 +436,9 @@ class FoodAnalyzerApp:
         self.entry_ref = tk.Entry(form_grid, font=("Arial", 10), width=26)
         self.entry_ref.grid(row=5, column=1, sticky="we", pady=2)
 
-        # Items Table Section
-        items_frame = tk.LabelFrame(right_box, text=" Items & Prices to Record in Excel ", font=self.label_font_gentle, bg=self.bg_color, padx=4, pady=4)
-        items_frame.pack(fill="both", expand=True, pady=4)
+        # Items Table Section (compact, ~1/2 size)
+        items_frame = tk.LabelFrame(right_box, text=" Items & Prices to Record in Excel ", font=self.label_font_gentle, bg=self.bg_color, padx=4, pady=2)
+        items_frame.pack(fill="x", pady=2)
 
         tree_scroll = tk.Scrollbar(items_frame)
         tree_scroll.pack(side="right", fill="y")
@@ -447,7 +447,7 @@ class FoodAnalyzerApp:
             items_frame,
             columns=("Item", "Price"),
             show="headings",
-            height=5,
+            height=3,
             yscrollcommand=tree_scroll.set
         )
         self.tree_items.heading("Item", text="Item (Dish / Food)")
@@ -459,14 +459,29 @@ class FoodAnalyzerApp:
 
         # Items Table Action Bar
         item_bar = tk.Frame(right_box, bg=self.bg_color)
-        item_bar.pack(fill="x", pady=2)
+        item_bar.pack(fill="x", pady=1)
         self.lbl_items_summary = tk.Label(item_bar, text="0 Items | Total: $0.00", font=self.label_font, bg=self.bg_color, fg="#2C3E50")
         self.lbl_items_summary.pack(side="left")
 
-        # Detailed OCR / Analysis Log
-        tk.Label(right_box, text="OCR Raw Log & Extracted Text:", font=self.note_font, bg=self.bg_color, anchor="w").pack(fill="x", pady=(4, 1))
-        self.txt_analysis = tk.Text(right_box, height=5, font=("Courier", 8), wrap="word", relief="solid", bd=1)
-        self.txt_analysis.pack(fill="both", expand=True, pady=2)
+        # Detailed OCR / Analysis Log (enlarged)
+        tk.Label(right_box, text="OCR Raw Log & Extracted Text:", font=self.note_font, bg=self.bg_color, anchor="w").pack(fill="x", pady=(3, 1))
+        ocr_log_frame = tk.Frame(right_box, bg=self.bg_color)
+        ocr_log_frame.pack(fill="both", expand=True, pady=2)
+
+        ocr_scroll = tk.Scrollbar(ocr_log_frame)
+        ocr_scroll.pack(side="right", fill="y")
+
+        self.txt_analysis = tk.Text(
+            ocr_log_frame,
+            height=10,
+            font=("Courier", 8),
+            wrap="word",
+            relief="solid",
+            bd=1,
+            yscrollcommand=ocr_scroll.set
+        )
+        self.txt_analysis.pack(side="left", fill="both", expand=True)
+        ocr_scroll.config(command=self.txt_analysis.yview)
 
         # Bottom Status / Log Console Panel
         status_frame = tk.Frame(self.master, bg="#34495E", pady=4, padx=8)
@@ -870,7 +885,9 @@ class FoodAnalyzerApp:
                 title="Import Food Photo (None found in base folder)",
                 initialdir=last_dir,
                 filetypes=[
-                    ("Image Files", "*.jpg;*.jpeg;*.png;*.webp;*.bmp;*.gif;*.tiff;*.heic"),
+                    ("Image Files", "*.jpg *.jpeg *.png *.webp *.bmp *.gif *.tiff *.heic *.JPG *.JPEG *.PNG *.WEBP *.BMP *.GIF *.TIFF *.HEIC"),
+                    ("JPEG Files", "*.jpg *.jpeg *.JPG *.JPEG"),
+                    ("PNG Files", "*.png *.PNG"),
                     ("All Files", "*.*")
                 ]
             )
