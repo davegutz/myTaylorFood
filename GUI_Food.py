@@ -18,6 +18,7 @@ import time
 import datetime
 import shutil
 import re
+import subprocess
 from pathlib import Path, PurePosixPath
 from configparser import ConfigParser
 import tkinter as tk
@@ -557,14 +558,139 @@ class FoodAnalyzerApp:
         else:
             os.system(f'explorer "{folder}"')
 
+    def _get_pids_locking_file(self, file_path):
+        """Discovers process IDs currently holding or locking file_path."""
+        pids = set()
+        p_str = str(Path(file_path).resolve())
+        # 1. Try fuser (Linux)
+        if shutil.which("fuser"):
+            try:
+                res = subprocess.run(["fuser", p_str], capture_output=True, text=True)
+                for part in (res.stdout + " " + res.stderr).split():
+                    if part.strip().isdigit():
+                        pids.add(int(part.strip()))
+            except Exception:
+                pass
+        # 2. Try lsof (Linux/macOS)
+        if shutil.which("lsof") and not pids:
+            try:
+                res = subprocess.run(["lsof", "-t", p_str], capture_output=True, text=True)
+                for line in res.stdout.strip().splitlines():
+                    if line.strip().isdigit():
+                        pids.add(int(line.strip()))
+            except Exception:
+                pass
+        return list(pids)
+
+    def _is_file_open_in_process(self, file_path):
+        """Checks if a file is currently open in Excel or another program."""
+        p = Path(file_path).resolve()
+        if not p.is_file():
+            return False, []
+
+        # 1. Check for standard Office / LibreOffice lock files
+        lock_libre = p.parent / f".~lock.{p.name}#"
+        lock_excel = p.parent / f"~${p.name}"
+        if lock_libre.exists() or lock_excel.exists():
+            pids = self._get_pids_locking_file(str(p))
+            return True, pids
+
+        # 2. Check active OS locking PIDs
+        pids = self._get_pids_locking_file(str(p))
+        if pids:
+            return True, pids
+
+        # 3. Test exclusive file access
+        try:
+            with open(str(p), "r+b"):
+                pass
+        except (PermissionError, IOError):
+            return True, []
+
+        return False, []
+
+    def _close_pids(self, pids):
+        """Attempts to terminate processes by PID."""
+        for pid in pids:
+            try:
+                if plat == "win32":
+                    subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True)
+                else:
+                    os.kill(pid, 15)  # SIGTERM
+                    time.sleep(0.3)
+                    try:
+                        os.kill(pid, 0)
+                        os.kill(pid, 9)  # SIGKILL
+                    except OSError:
+                        pass
+            except Exception as e:
+                print(f"Notice: could not terminate PID {pid}: {e}")
+
+    def _cleanup_lock_files(self, file_path):
+        """Removes orphaned lock files (LibreOffice or Office) if process was closed."""
+        p = Path(file_path).resolve()
+        lock_libre = p.parent / f".~lock.{p.name}#"
+        lock_excel = p.parent / f"~${p.name}"
+        for lf in (lock_libre, lock_excel):
+            try:
+                if lf.exists():
+                    lf.unlink()
+            except Exception:
+                pass
+
+    def _check_and_prompt_if_excel_open(self, file_path, action_desc="open"):
+        """Checks if file_path is already open in Excel / another process.
+        Prompts user to close it first.
+        Returns:
+            True: safe to proceed.
+            False: user cancelled / said No; warned that file is out of date and will not overwrite/launch.
+        """
+        is_open, pids = self._is_file_open_in_process(file_path)
+        if not is_open:
+            return True
+
+        filename = os.path.basename(file_path)
+        ans = messagebox.askyesno(
+            "Excel File Already Open",
+            f"'{filename}' appears to be currently open in another program / Excel.\n\n"
+            f"Would you like to close the existing process first before {action_desc}ing?",
+            icon="warning"
+        )
+        if ans:
+            self._close_pids(pids)
+            self._cleanup_lock_files(file_path)
+            time.sleep(0.5)
+            still_open, _ = self._is_file_open_in_process(file_path)
+            if still_open:
+                messagebox.showwarning(
+                    "Process Still Active",
+                    f"Could not automatically close the existing process for '{filename}'.\n\n"
+                    f"Please save and close it manually before {action_desc}ing."
+                )
+                return False
+            self.log_status(f"Closed existing process for {filename}.")
+            return True
+        else:
+            messagebox.showwarning(
+                "Out of Date Warning",
+                f"'{filename}' remains open in another process.\n\n"
+                f"Warning: The existing open copy may be out of date. Changes will not be overwritten until it is closed."
+            )
+            self.log_status(f"Cancelled {action_desc}: {filename} is open in another process.")
+            return False
+
     def open_excel_file(self):
-        """Opens the Excel records file in the default spreadsheet application."""
+        """Opens the Excel records file in the default spreadsheet application, checking if already open first."""
         file_target = self.excel_path
         if not Path(file_target).exists() or Path(file_target).stat().st_size == 0:
             messagebox.showwarning(
                 "File Not Found",
                 f"Excel file does not exist yet:\n{file_target}\n\nPlease click '3. Record to Excel' to create and save records first."
             )
+            return
+
+        # Check if already open in Excel / spreadsheet app
+        if not self._check_and_prompt_if_excel_open(file_target, action_desc="open"):
             return
 
         self.log_status(f"Opening Excel file: {os.path.basename(file_target)}")
@@ -1652,6 +1778,10 @@ class FoodAnalyzerApp:
 
         # 5. Sort all rows by Date & Time: most recent first (descending)
         deduped_rows.sort(key=lambda r: self._parse_row_datetime(r[0], r[1]), reverse=True)
+
+        # Check if Excel file is already open in another process before saving
+        if Path(excel_target).exists() and not self._check_and_prompt_if_excel_open(excel_target, action_desc="overwrite"):
+            return
 
         # 6. Write to Excel file using openpyxl with subsheets for each Individual
         try:
